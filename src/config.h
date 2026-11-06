@@ -318,6 +318,9 @@ namespace config {
 
     bool high_resolution_scrolling;  ///< Enable high-resolution mouse-wheel events.
     bool native_pen_touch;  ///< Enable native pen and touch injection.
+
+    std::string local_mouse_policy;  ///< `allow` or `remote_priority`: whether a physical mouse on the host is ignored while a client is active.
+    int local_mouse_grace_ms;  ///< Milliseconds the physical mouse stays ignored after the last client input.
   };
 
   namespace flag {
@@ -408,6 +411,7 @@ namespace config {
   };
 
   extern video_t video;
+  extern bool vr_compose_enabled;  ///< Capture selected windows one by one into one image for the VR client (Windows).
   extern audio_t audio;
   extern stream_t stream;
   extern nvhttp_t nvhttp;

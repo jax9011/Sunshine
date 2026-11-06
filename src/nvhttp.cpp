@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <format>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -40,6 +41,11 @@
 #include "utility.h"
 #include "uuid.h"
 #include "video.h"
+
+#ifdef _WIN32
+  #include "platform/windows/vr_compose.h"
+  #include "platform/windows/vr_windows.h"
+#endif
 
 using namespace std::literals;
 
@@ -1358,6 +1364,149 @@ namespace nvhttp {
     }
   }
 
+#ifdef _WIN32
+  /**
+   * @brief Write a JSON body as the HTTPS response.
+   *
+   * @param response HTTP response object to populate.
+   * @param body JSON document to send.
+   */
+  void send_vr_json(resp_https_t response, const nlohmann::json &body) {
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json");
+    response->write(SimpleWeb::StatusCode::success_ok, body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), headers);
+  }
+
+  /**
+   * @brief Report visible desktop windows so the VR client can show and click only inside them.
+   *
+   * @details Polled several times per second, so it keeps the connection alive and does not log each request.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void vr_windows(resp_https_t response, req_https_t /*request*/) {
+    auto snap = platf::vr::list_windows();
+
+    const bool compose = platf::vr_compose::enabled();
+    platf::vr_compose::layout_t layout;
+    if (compose) {
+      layout = platf::vr_compose::current();
+    }
+
+    nlohmann::json windows = nlohmann::json::array();
+    for (const auto &w : snap.windows) {
+      nlohmann::json entry = {{"id", w.id}, {"pid", w.pid}, {"owner", w.owner}, {"x", w.x}, {"y", w.y}, {"w", w.w}, {"h", w.h}, {"z", w.z}, {"title", w.title}};
+
+      if (compose && layout.atlas_w > 0 && layout.screen_w > 0) {
+        // Where the window's own picture sits in the stream, and where the window really is on the desktop
+        for (const auto &slot : layout.slots) {
+          if (static_cast<long long>(slot.hwnd) != w.id) {
+            continue;
+          }
+          entry["ax"] = static_cast<double>(slot.ax) / layout.atlas_w;
+          entry["ay"] = static_cast<double>(slot.ay) / layout.atlas_h;
+          entry["aw"] = static_cast<double>(slot.aw) / layout.atlas_w;
+          entry["ah"] = static_cast<double>(slot.ah) / layout.atlas_h;
+          entry["x"] = static_cast<double>(slot.dx) / layout.screen_w;
+          entry["y"] = static_cast<double>(slot.dy) / layout.screen_h;
+          entry["w"] = static_cast<double>(slot.aw) / layout.screen_w;
+          entry["h"] = static_cast<double>(slot.ah) / layout.screen_h;
+          break;
+        }
+      }
+      windows.push_back(std::move(entry));
+    }
+
+    nlohmann::json body = {{"screen", {{"w", snap.screen_w}, {"h", snap.screen_h}}}, {"windows", windows}};
+    if (compose) {
+      body["compose"] = {{"atlas_w", layout.atlas_w}, {"atlas_h", layout.atlas_h}, {"version", layout.version}};
+    }
+    send_vr_json(response, body);
+  }
+
+  /**
+   * @brief Choose which windows the composed capture shows. `ids` is a comma-separated list of window ids from /vrwindows.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void vr_compose_set(resp_https_t response, req_https_t request) {
+    auto args = request->parse_query_string();
+    std::vector<std::uint64_t> ids;
+    std::stringstream list {get_arg(args, "ids", "")};
+    std::string item;
+    while (std::getline(list, item, ',')) {
+      try {
+        ids.push_back(std::stoull(item));
+      } catch (const std::exception &) {
+        // ignore a broken entry
+      }
+    }
+    platf::vr_compose::set_windows(ids);
+    send_vr_json(response, {{"ok", true}, {"enabled", platf::vr_compose::enabled()}, {"count", ids.size()}});
+  }
+
+  /**
+   * @brief Tell the host which window the VR pointer is on, so input is delivered to it.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void vr_focus(resp_https_t response, req_https_t request) {
+    auto args = request->parse_query_string();
+    std::uint64_t id = 0;
+    try {
+      id = std::stoull(get_arg(args, "id", "0"));
+    } catch (const std::exception &) {
+      id = 0;
+    }
+    platf::vr_compose::set_focus_target(id);
+    send_vr_json(response, {{"ok", true}});
+  }
+
+  /**
+   * @brief List Start Menu apps for the VR client's Apps panel.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void vr_apps(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+
+    nlohmann::json apps = nlohmann::json::array();
+    for (const auto &a : platf::vr::scan_apps()) {
+      apps.push_back({{"id", a.id}, {"name", a.name}});
+    }
+    send_vr_json(response, apps);
+  }
+
+  /**
+   * @brief Launch a Start Menu app chosen in the VR client. Only ids from the last /vrapps scan are accepted.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void vr_launch(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+
+    auto args = request->parse_query_string();
+    int id = -1;
+    try {
+      id = std::stoi(get_arg(args, "id", "-1"));
+    } catch (const std::exception &) {
+      id = -1;
+    }
+
+    std::string name;
+    if (platf::vr::launch_app(id, name)) {
+      send_vr_json(response, {{"ok", true}, {"name", name}});
+    } else {
+      send_vr_json(response, {{"ok", false}, {"error", "unknown app id or launch failed"}});
+    }
+  }
+#endif
+
   /**
    * @brief Launch the requested application for a GameStream session.
    *
@@ -1402,7 +1551,10 @@ namespace nvhttp {
 
     auto appid = util::from_view(get_arg(args, "appid"));
 
-    auto current_appid = proc::proc.running();
+    // Window-mode apps stream their own window and run next to any other app, so they don't conflict with it.
+    const bool window_app = appid > 0 && proc::proc.is_window_app(static_cast<int>(appid));
+
+    auto current_appid = window_app ? 0 : proc::proc.running();
     if (current_appid > 0) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 400);
@@ -1415,13 +1567,15 @@ namespace nvhttp {
     auto launch_session = make_launch_session(host_audio, args);
 
     if (rtsp_stream::session_count() == 0) {
-      // The display should be restored in case something fails as there are no other sessions.
-      revert_display_configuration = true;
+      if (!window_app) {
+        // The display should be restored in case something fails as there are no other sessions.
+        revert_display_configuration = true;
 
-      // We want to prepare display only if there are no active sessions at
-      // the moment. This should be done before probing encoders as it could
-      // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+        // We want to prepare display only if there are no active sessions at
+        // the moment. This should be done before probing encoders as it could
+        // change the active displays.
+        display_device::configure_display(config::video, *launch_session);
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1448,7 +1602,7 @@ namespace nvhttp {
     }
 
     if (appid > 0) {
-      auto err = proc::proc.execute((int) appid, launch_session);
+      auto err = window_app ? proc::launch_window_app(static_cast<int>(appid), launch_session) : proc::proc.execute((int) appid, launch_session);
       if (err) {
         tree.put("root.<xmlattr>.status_code", err);
         tree.put("root.<xmlattr>.status_message", "Failed to start the specified application");
@@ -1597,6 +1751,8 @@ namespace nvhttp {
 
     rtsp_stream::terminate_sessions();
 
+    proc::terminate_window_apps();
+
     if (proc::proc.running() > 0) {
       proc::proc.terminate();
     }
@@ -1739,6 +1895,13 @@ namespace nvhttp {
       resume(host_audio, resp, req);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
+#ifdef _WIN32
+    https_server.resource["^/vrwindows$"]["GET"] = vr_windows;
+    https_server.resource["^/vrapps$"]["GET"] = vr_apps;
+    https_server.resource["^/vrlaunch$"]["GET"] = vr_launch;
+    https_server.resource["^/vrcompose$"]["GET"] = vr_compose_set;
+    https_server.resource["^/vrfocus$"]["GET"] = vr_focus;
+#endif
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);

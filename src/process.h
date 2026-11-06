@@ -13,6 +13,9 @@
 #endif
 
 // standard includes
+#include <chrono>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 
@@ -22,6 +25,9 @@
 #include "rtsp.h"
 #include "src/boost_process_compat.h"
 #include "utility.h"
+#ifdef _WIN32
+  #include "platform/windows/window_host.h"
+#endif
 
 /**
  * @def DEFAULT_APP_IMAGE_PATH
@@ -79,6 +85,8 @@ namespace proc {
     bool auto_detach;  ///< Whether the process should detach automatically.
     bool wait_all;  ///< Whether Sunshine waits for all child processes.
     std::chrono::seconds exit_timeout;  ///< Exit timeout.
+    bool window_mode = false;  ///< Stream only this app's own window, independently of other apps, and end the stream when it closes (Windows).
+    std::string window_match;  ///< In window mode, optional title fragment for apps that hand off to another process.
   };
 
   /**
@@ -160,6 +168,32 @@ namespace proc {
      */
     void update_apps_and_env(proc_t &&other);
 
+    /**
+     * @brief Create an independent process manager for one app so several apps can run side by side.
+     *
+     * @param app_id Id of a configured app.
+     * @return A manager holding only that app, or `nullptr` if the id is unknown.
+     */
+    std::unique_ptr<proc_t> make_instance(int app_id) const;
+
+    /**
+     * @brief Check whether an app is configured to stream its own window.
+     *
+     * @param app_id Id of a configured app.
+     * @return `true` if the app has window mode enabled.
+     */
+    bool is_window_app(int app_id) const;
+
+#ifdef _WIN32
+    /**
+     * @brief Wait for the running app's window and return it.
+     *
+     * @param timeout Longest time to wait.
+     * @return Native window handle, or 0 if the app has no window (yet).
+     */
+    std::uint64_t window_handle(std::chrono::seconds timeout);
+#endif
+
 #ifdef SUNSHINE_TESTS
     /**
      * @brief Get the current process environment (strictly for unit tests).
@@ -180,13 +214,65 @@ namespace proc {
     // If no command associated with _app_id, yet it's still running
     bool placebo {};
 
+    // Set for managers created by make_instance(): they must not touch state shared with other running apps.
+    bool _instance {};
+
     boost::process::v1::child _process;
     boost::process::v1::group _process_group;
 
     file_t _pipe;
     std::vector<cmd_t>::const_iterator _app_prep_it;
     std::vector<cmd_t>::const_iterator _app_prep_begin;
+
+#ifdef _WIN32
+    std::unique_ptr<platf::window_host::watcher_t> _window_watcher;  ///< Finds the window of a window-mode app.
+#endif
   };
+
+  /**
+   * @brief Start a window-mode app next to any other running apps.
+   *
+   * @param app_id Id of a configured app with window mode enabled.
+   * @param launch_session Launch session that will stream it.
+   * @return 0 on success, otherwise an HTTP-style error code.
+   */
+  int launch_window_app(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session);
+
+  /**
+   * @brief Check whether a window-mode app is still running.
+   *
+   * @param app_id Id of the app.
+   * @return `app_id` while it runs, otherwise 0 (a finished app is cleaned up).
+   */
+  int window_app_running(int app_id);
+
+  /**
+   * @brief Get the window of a running window-mode app.
+   *
+   * @param app_id Id of the app.
+   * @param timeout Longest time to wait for the window to appear.
+   * @return Native window handle, or 0.
+   */
+  std::uint64_t window_app_handle(int app_id, std::chrono::seconds timeout);
+
+  /**
+   * @brief Stop one window-mode app.
+   *
+   * @param app_id Id of the app.
+   */
+  void terminate_window_app(int app_id);
+
+  /**
+   * @brief Stop every window-mode app.
+   */
+  void terminate_window_apps();
+
+  /**
+   * @brief List the window-mode apps that are currently running.
+   *
+   * @return App ids.
+   */
+  std::vector<int> running_window_apps();
 
   /**
    * @brief Calculate a stable id based on name and image data

@@ -31,6 +31,12 @@ extern "C" {
 #include "config.h"
 #include "globals.h"
 #include "input.h"
+#include <atomic>
+#include "input_arbiter.h"
+#ifdef _WIN32
+  #include "platform/windows/window_host.h"
+  #include "platform/windows/vr_compose.h"
+#endif
 #include "logging.h"
 #include "platform/common.h"
 #include "platform/virtualhid_input.h"
@@ -279,6 +285,8 @@ namespace input {
    * @brief Input emulation settings loaded from configuration.
    */
   struct input_t {
+    std::atomic<std::uint64_t> window_handle {0};  ///< Window that receives this stream's input, or 0 for the desktop.
+
     /**
      * @brief Enumerates supported shortkey options.
      */
@@ -763,12 +771,29 @@ namespace input {
   }
 
   /**
+   * @brief Bookkeeping that runs for every packet coming from a client.
+   *
+   * @param input Input state of the session that sent the packet.
+   */
+  void on_remote_input(const std::shared_ptr<input_t> &input) {
+    arbiter::note_remote_activity();
+#ifdef _WIN32
+    if (const auto window = input->window_handle.load(std::memory_order_relaxed)) {
+      platf::window_host::focus_window(window);
+    } else {
+      platf::vr_compose::apply_focus();
+    }
+#endif
+  }
+
+  /**
    * @brief Forward a client input packet directly to the platform backend.
    *
    * @param input Platform input backend that receives the event.
    * @param packet Protocol packet being processed.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_REL_MOUSE_MOVE_PACKET packet) {
+    on_remote_input(input);
     if (!config::input.mouse) {
       return;
     }
@@ -878,7 +903,43 @@ namespace input {
    * @param input Platform input backend that receives the event.
    * @param packet Protocol packet being processed.
    */
+  std::optional<std::pair<float, float>> vr_map_atlas_pointer(std::shared_ptr<input_t> &input, const std::pair<float, float> &p) {
+#ifdef _WIN32
+    if (!platf::vr_compose::enabled()) {
+      return std::nullopt;
+    }
+    const auto target = platf::vr_compose::focus_target();
+    if (!target) {
+      return std::nullopt;
+    }
+    const auto layout = platf::vr_compose::current();
+    if (layout.atlas_w <= 0 || layout.atlas_h <= 0 || layout.screen_w <= 0 || layout.screen_h <= 0) {
+      return std::nullopt;
+    }
+    for (const auto &slot : layout.slots) {
+      for (const auto &member : slot.members) {
+        if (member.hwnd != target || member.w <= 0 || member.h <= 0) {
+          continue;
+        }
+        const float source_x = static_cast<float>(slot.ax + member.ox);
+        const float source_y = static_cast<float>(slot.ay + member.oy);
+        const float local_x = std::clamp(p.first - source_x, 0.0f, static_cast<float>(member.w));
+        const float local_y = std::clamp(p.second - source_y, 0.0f, static_cast<float>(member.h));
+        const float desktop_x = (static_cast<float>(slot.dx + member.ox) + local_x) / static_cast<float>(layout.screen_w);
+        const float desktop_y = (static_cast<float>(slot.dy + member.oy) + local_y) / static_cast<float>(layout.screen_h);
+        refresh_touch_port(input);
+        if (!input->touch_port) {
+          return std::nullopt;
+        }
+        return std::pair {desktop_x * input->touch_port.width, desktop_y * input->touch_port.height};
+      }
+    }
+#endif
+    return std::nullopt;
+  }
+
   void passthrough(std::shared_ptr<input_t> &input, PNV_ABS_MOUSE_MOVE_PACKET packet) {
+    on_remote_input(input);
     if (!config::input.mouse) {
       return;
     }
@@ -906,6 +967,16 @@ namespace input {
       return;
     }
 
+#ifdef _WIN32
+    // In VR window-only mode the stream is an atlas, not the desktop.
+    // Translate the focused panel's atlas coordinates back to the real desktop
+    // before injecting the mouse event. This prevents clicks from landing at
+    // the atlas packing position on the hidden desktop.
+    if (auto mapped = vr_map_atlas_pointer(input, *tpcoords)) {
+      *tpcoords = *mapped;
+    }
+#endif
+
     auto &touch_port = input->touch_port;
 
     platf::abs_mouse(platf_input, platform_touch_port(touch_port), tpcoords->first, tpcoords->second);
@@ -918,6 +989,7 @@ namespace input {
    * @param packet The mouse button packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_MOUSE_BUTTON_PACKET packet) {
+    on_remote_input(input);
     if (!config::input.mouse) {
       return;
     }
@@ -1191,6 +1263,7 @@ namespace input {
    * @param packet Protocol packet being processed.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_KEYBOARD_PACKET packet) {
+    on_remote_input(input);
     if (!config::input.keyboard) {
       return;
     }
@@ -1264,6 +1337,7 @@ namespace input {
    * @param packet The scroll packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_SCROLL_PACKET packet) {
+    on_remote_input(input);
     if (!config::input.mouse) {
       return;
     }
@@ -1287,6 +1361,7 @@ namespace input {
    * @param packet The scroll packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_HSCROLL_PACKET packet) {
+    on_remote_input(input);
     if (!config::input.mouse) {
       return;
     }
@@ -1463,6 +1538,7 @@ namespace input {
    * @param packet The touch packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_TOUCH_PACKET packet) {
+    on_remote_input(input);
     const auto pointer_data = prepare_absolute_pointer_data(input, packet);
     if (!pointer_data) {
       return;
@@ -1488,6 +1564,7 @@ namespace input {
    * @param packet The pen packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_PEN_PACKET packet) {
+    on_remote_input(input);
     const auto pointer_data = prepare_absolute_pointer_data(input, packet);
     if (!pointer_data) {
       return;
@@ -2547,4 +2624,10 @@ namespace input {
     }
   }  // namespace testing
 #endif
+
+  void set_window_target(const std::shared_ptr<input_t> &input, std::uint64_t window) {
+    if (input) {
+      input->window_handle.store(window, std::memory_order_relaxed);
+    }
+  }
 }  // namespace input

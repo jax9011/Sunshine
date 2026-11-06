@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -39,6 +42,7 @@
 #ifdef _WIN32
   // from_utf8() string conversion function
   #include "platform/windows/utf_utils.h"
+  #include "platform/windows/window_host.h"
 
   // _SH constants for _wfsopen()
   #include <share.h>
@@ -324,6 +328,15 @@ namespace proc {
         BOOST_LOG(warning) << "Couldn't run ["sv << command << "]: System: "sv << ec.message();
         return -1;
       }
+
+      if (_app.window_mode) {
+#ifdef _WIN32
+        _window_watcher = std::make_unique<platf::window_host::watcher_t>();
+        _window_watcher->start({static_cast<std::uint32_t>(_process.id()), _app.window_match, 30s});
+#else
+        BOOST_LOG(warning) << "window-mode is only supported on Windows; streaming the whole display"sv;
+#endif
+      }
     }
 
     _app_launch_time = std::chrono::steady_clock::now();
@@ -342,6 +355,14 @@ namespace proc {
     auto reaper = util::fail_guard([]() {
       while (waitpid(-1, nullptr, WNOHANG) > 0);
     });
+#endif
+
+#ifdef _WIN32
+    if (_app_id > 0 && _window_watcher && _window_watcher->window_closed()) {
+      BOOST_LOG(info) << "The window of ["sv << _app.name << "] was closed; ending the app"sv;
+      terminate();
+      return 0;
+    }
 #endif
 
     if (placebo) {
@@ -369,10 +390,19 @@ namespace proc {
   }
 
   void proc_t::terminate() {
-    input::terminate_gamepads();
+    // A window-mode app runs next to other apps, so it must not tear down state they share.
+    if (!_instance) {
+      input::terminate_gamepads();
+    }
     std::error_code ec;
     placebo = false;
     terminate_process_group(_process, _process_group, _app.exit_timeout);
+#ifdef _WIN32
+    if (_window_watcher) {
+      _window_watcher->stop();
+      _window_watcher.reset();
+    }
+#endif
     _process = boost::process::v1::child();
     _process_group = boost::process::v1::group();
 
@@ -408,6 +438,9 @@ namespace proc {
 
     // Only show the Stopped notification if we actually have an app to stop
     // Since terminate() is always run when a new app has started
+    if (_instance) {
+      has_run = false;
+    }
     if (proc::proc.get_last_run_app_name().length() > 0 && has_run) {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
       system_tray::update_tray_stopped(proc::proc.get_last_run_app_name());
@@ -443,6 +476,35 @@ namespace proc {
   std::string proc_t::get_last_run_app_name() {
     return _app.name;
   }
+
+  std::unique_ptr<proc_t> proc_t::make_instance(int app_id) const {
+    const auto id = std::to_string(app_id);
+    auto it = std::find_if(_apps.begin(), _apps.end(), [&id](const auto &app) {
+      return app.id == id;
+    });
+    if (it == _apps.end()) {
+      return nullptr;
+    }
+
+    auto env = _env;
+    std::vector<ctx_t> apps {*it};
+    auto instance = std::make_unique<proc_t>(std::move(env), std::move(apps));
+    instance->_instance = true;
+    return instance;
+  }
+
+  bool proc_t::is_window_app(int app_id) const {
+    const auto id = std::to_string(app_id);
+    return std::any_of(_apps.begin(), _apps.end(), [&id](const auto &app) {
+      return app.id == id && app.window_mode && !app.cmd.empty();
+    });
+  }
+
+#ifdef _WIN32
+  std::uint64_t proc_t::window_handle(std::chrono::seconds timeout) {
+    return _window_watcher ? _window_watcher->wait_for_window(timeout) : 0;
+  }
+#endif
 
   void proc_t::update_apps_and_env(proc_t &&other) {
     if (_app_id > 0 || placebo) {
@@ -761,6 +823,8 @@ namespace proc {
         auto auto_detach = app_node.get_optional<bool>("auto-detach"s);
         auto wait_all = app_node.get_optional<bool>("wait-all"s);
         auto exit_timeout = app_node.get_optional<int>("exit-timeout"s);
+        auto window_mode = app_node.get_optional<bool>("window-mode"s);
+        auto window_match = app_node.get_optional<std::string>("window-match"s);
 
         std::vector<proc::cmd_t> prep_cmds;
         if (!exclude_global_prep.value_or(false)) {
@@ -830,6 +894,10 @@ namespace proc {
         ctx.auto_detach = auto_detach.value_or(true);
         ctx.wait_all = wait_all.value_or(true);
         ctx.exit_timeout = std::chrono::seconds {exit_timeout.value_or(5)};
+        ctx.window_mode = window_mode.value_or(false);
+        if (window_match) {
+          ctx.window_match = parse_env_val(this_env, *window_match);
+        }
 
         auto possible_ids = calculate_app_id(name, ctx.image_path, i++);
         if (ids.count(std::get<0>(possible_ids)) == 0) {
@@ -892,5 +960,103 @@ namespace proc {
       proc.update_apps_and_env(std::move(*proc_opt));
       last_apps_file_update = current_time;
     }
+  }
+
+  namespace {
+    std::mutex window_apps_mutex;  ///< Guards window_apps.
+    std::map<int, std::shared_ptr<proc_t>> window_apps;  ///< Running window-mode apps by app id.
+  }  // namespace
+
+  int launch_window_app(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    std::lock_guard lock {window_apps_mutex};
+
+    if (auto it = window_apps.find(app_id); it != window_apps.end()) {
+      if (it->second->running() > 0) {
+        return 0;  // already running; the new session attaches to its window
+      }
+      window_apps.erase(it);
+    }
+
+    auto instance = proc::proc.make_instance(app_id);
+    if (!instance) {
+      return 404;
+    }
+    if (instance->execute(app_id, std::move(launch_session)) != 0) {
+      return 503;
+    }
+    window_apps[app_id] = std::move(instance);
+    return 0;
+  }
+
+  int window_app_running(int app_id) {
+    std::lock_guard lock {window_apps_mutex};
+    auto it = window_apps.find(app_id);
+    if (it == window_apps.end()) {
+      return 0;
+    }
+    if (it->second->running() == 0) {
+      window_apps.erase(it);
+      return 0;
+    }
+    return app_id;
+  }
+
+  std::uint64_t window_app_handle(int app_id, std::chrono::seconds timeout) {
+#ifdef _WIN32
+    std::shared_ptr<proc_t> instance;
+    {
+      std::lock_guard lock {window_apps_mutex};
+      if (auto it = window_apps.find(app_id); it != window_apps.end()) {
+        instance = it->second;
+      }
+    }
+    // The shared pointer keeps the instance alive while we wait, even if the app ends meanwhile.
+    return instance ? instance->window_handle(timeout) : 0;
+#else
+    return 0;
+#endif
+  }
+
+  void terminate_window_app(int app_id) {
+    std::shared_ptr<proc_t> instance;
+    {
+      std::lock_guard lock {window_apps_mutex};
+      if (auto it = window_apps.find(app_id); it != window_apps.end()) {
+        instance = std::move(it->second);
+        window_apps.erase(it);
+      }
+    }
+    if (instance) {
+      instance->terminate();
+    }
+  }
+
+  void terminate_window_apps() {
+    std::map<int, std::shared_ptr<proc_t>> doomed;
+    {
+      std::lock_guard lock {window_apps_mutex};
+      doomed.swap(window_apps);
+    }
+    for (auto &[id, instance] : doomed) {
+      instance->terminate();
+    }
+  }
+
+  std::vector<int> running_window_apps() {
+    std::vector<int> ids;
+    {
+      std::lock_guard lock {window_apps_mutex};
+      for (const auto &[id, instance] : window_apps) {
+        ids.push_back(id);
+      }
+    }
+    // Re-check outside the registry loop so finished apps are cleaned up.
+    std::vector<int> alive;
+    for (auto id : ids) {
+      if (window_app_running(id)) {
+        alive.push_back(id);
+      }
+    }
+    return alive;
   }
 }  // namespace proc

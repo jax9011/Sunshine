@@ -734,6 +734,8 @@ namespace config {
   /**
    * @brief Default video configuration values used before file and CLI overrides.
    */
+  bool vr_compose_enabled = false;
+
   video_t video {
     28,  // qp
 
@@ -887,6 +889,9 @@ namespace config {
     true,  // always send scancodes
     true,  // high resolution scrolling
     true,  // native pen/touch support
+
+    "allow",  // local mouse policy: keep upstream behavior
+    1500,  // local mouse grace period in milliseconds
   };
 
   /**
@@ -1884,6 +1889,10 @@ namespace config {
 
     bool_f(vars, "high_resolution_scrolling", input.high_resolution_scrolling);
     bool_f(vars, "native_pen_touch", input.native_pen_touch);
+
+    bool_f(vars, "vr_compose", vr_compose_enabled);
+    string_restricted_f(vars, "local_mouse_policy", input.local_mouse_policy, {"allow", "remote_priority"});
+    int_between_f(vars, "local_mouse_grace_ms", input.local_mouse_grace_ms, {200, 10000});
 
     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
     bool_f(vars, "system_tray", sunshine.system_tray);

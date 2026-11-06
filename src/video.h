@@ -43,6 +43,7 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    std::uint64_t windowHandle = 0;  ///< Native window handle to capture instead of a display, or 0 for the display (Windows).
   };
 
   namespace amf {

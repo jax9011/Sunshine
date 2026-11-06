@@ -8,6 +8,9 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <memory>
+#include <mutex>
+#include <map>
 #include <thread>
 #include <utility>
 
@@ -669,6 +672,7 @@ namespace video {
     safe::signal_t reinit_event;  ///< Reinit event.
     const encoder_t *encoder_p;  ///< Encoder p.
     sync_util::sync_t<std::weak_ptr<platf::display_t>> display_wp;  ///< Display wp.
+    std::uint64_t window_handle = 0;  ///< Window captured by this thread, or 0 for the shared display capture.
   };
 
   /**
@@ -708,6 +712,33 @@ namespace video {
   // Keep a reference counter to ensure the capture thread only runs when other threads have a reference to the capture thread
   auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);  ///< Capture thread async.
   auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);  ///< Capture thread sync.
+
+  /**
+   * @brief Get the capture thread dedicated to one window, creating it on first use.
+   *
+   * @details Every captured window gets its own thread and display, so several windows can be streamed at the
+   * same time without sharing frames. The thread only runs while at least one session holds a reference.
+   *
+   * @param window_handle Native window handle.
+   * @return Shared capture thread for that window.
+   */
+  safe::shared_t<capture_thread_async_ctx_t> &window_capture_thread(std::uint64_t window_handle) {
+    static std::mutex registry_mutex;
+    static std::map<std::uint64_t, std::unique_ptr<safe::shared_t<capture_thread_async_ctx_t>>> registry;
+
+    std::lock_guard lock {registry_mutex};
+    auto &entry = registry[window_handle];
+    if (!entry) {
+      entry = std::make_unique<safe::shared_t<capture_thread_async_ctx_t>>(
+        [window_handle](capture_thread_async_ctx_t &ctx) {
+          ctx.window_handle = window_handle;
+          return start_capture_async(ctx);
+        },
+        end_capture_async
+      );
+    }
+    return *entry;
+  }
 
 #ifdef _WIN32
   /**
@@ -1560,12 +1591,14 @@ namespace video {
    * @param display_wp Weak pointer holder for the active display.
    * @param reinit_event Signal raised while the display is being reinitialized.
    * @param encoder Selected encoder.
+   * @param window_handle Window to capture instead of a display, or 0.
    */
   void captureThread(
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue,
     sync_util::sync_t<std::weak_ptr<platf::display_t>> &display_wp,
     safe::signal_t &reinit_event,
-    const encoder_t &encoder
+    const encoder_t &encoder,
+    std::uint64_t window_handle
   ) {
     std::vector<capture_ctx_t> capture_ctxs;
 
@@ -1594,7 +1627,13 @@ namespace video {
     // get the most up-to-date list available monitors
     std::vector<std::string> display_names;
     int display_p = -1;
-    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+    if (window_handle) {
+      // A window capture thread serves exactly one window and never switches displays.
+      display_names.emplace_back("window:" + std::to_string(window_handle));
+      display_p = 0;
+    } else {
+      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+    }
     auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
     if (!disp) {
       return;
@@ -1705,7 +1744,7 @@ namespace video {
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
-      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
+      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit, window_handle](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
             capture_ctx = capture_ctxs.erase(capture_ctx);
@@ -1728,7 +1767,7 @@ namespace video {
           capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
         }
 
-        if (switch_display_event->peek()) {
+        if (!window_handle && switch_display_event->peek()) {
           artificial_reinit = true;
           return false;
         }
@@ -1783,10 +1822,12 @@ namespace video {
               disp.reset();
 
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+              if (!window_handle) {
+                refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+              }
 
               // Process any pending display switch with the new list of displays
-              if (switch_display_event->peek()) {
+              if (!window_handle && switch_display_event->peek()) {
                 display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
               }
 
@@ -2885,7 +2926,7 @@ namespace video {
       shutdown_event->raise(true);
     });
 
-    auto ref = capture_thread_async.ref();
+    auto ref = config.windowHandle ? window_capture_thread(config.windowHandle).ref() : capture_thread_async.ref();
     if (!ref) {
       return;
     }
@@ -2973,7 +3014,7 @@ namespace video {
     auto idr_events = mail->event<bool>(mail::idr);
 
     idr_events->raise(true);
-    if (chosen_encoder->flags & PARALLEL_ENCODING) {
+    if (config.windowHandle || (chosen_encoder->flags & PARALLEL_ENCODING)) {
       capture_async(std::move(mail), config, channel_data);
     } else {
       safe::signal_t join_event;
@@ -3676,7 +3717,8 @@ namespace video {
       capture_thread_ctx.capture_ctx_queue,
       std::ref(capture_thread_ctx.display_wp),
       std::ref(capture_thread_ctx.reinit_event),
-      std::ref(*capture_thread_ctx.encoder_p)
+      std::ref(*capture_thread_ctx.encoder_p),
+      capture_thread_ctx.window_handle
     };
 
     return 0;

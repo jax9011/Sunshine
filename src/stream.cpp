@@ -507,6 +507,8 @@ namespace stream {
 
     std::shared_ptr<input::input_t> input;  ///< Platform input device state for this stream.
 
+    int window_app_id {0};  ///< App whose window this session streams on its own, or 0 for the whole display.
+
     std::jthread audioThread;  ///< Audio thread.
     std::jthread videoThread;  ///< Video thread.
 
@@ -1357,6 +1359,11 @@ namespace stream {
 
           auto session = *pos;
 
+          if (session->window_app_id > 0 && proc::window_app_running(session->window_app_id) == 0 && session->state.load(std::memory_order_acquire) == session::state_e::RUNNING) {
+            BOOST_LOG(info) << "The streamed window was closed; ending its session"sv;
+            session::stop(*session);
+          }
+
           if (now > session->pingTimeout) {
             auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
             BOOST_LOG(info) << address << ": Ping Timeout"sv;
@@ -1405,7 +1412,7 @@ namespace stream {
       }
 
       // Don't break until any pending sessions either expire or connect
-      if (proc::proc.running() == 0 && !has_session_awaiting_peer) {
+      if (proc::proc.running() == 0 && proc::running_window_apps().empty() && !has_session_awaiting_peer) {
         BOOST_LOG(info) << "Process terminated"sv;
         break;
       }
@@ -2229,8 +2236,20 @@ namespace stream {
     auto address = session->video.peer.address();
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
+    auto video_config = session->config.monitor;
+    if (session->window_app_id > 0) {
+      // Stream just this app's window; wait for it to appear since the app may still be starting.
+      const auto window = proc::window_app_handle(session->window_app_id, 30s);
+      if (!window) {
+        BOOST_LOG(warning) << "The app has no window to stream"sv;
+        return;
+      }
+      video_config.windowHandle = window;
+      input::set_window_target(session->input, window);
+    }
+
     BOOST_LOG(debug) << "Start capturing Video"sv;
-    video::capture(session->mail, session->config.monitor, session);
+    video::capture(session->mail, video_config, session);
   }
 
   /**
@@ -2401,6 +2420,9 @@ namespace stream {
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 
       session->config = config;
+      if (launch_session.appid > 0 && proc::proc.is_window_app(launch_session.appid)) {
+        session->window_app_id = launch_session.appid;
+      }
 
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);

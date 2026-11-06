@@ -84,6 +84,17 @@ namespace input {
    */
   std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id);
 
+  /**
+   * @brief Send this stream's input to one window instead of whatever is on top (Windows).
+   *
+   * @details Used for streams of a single window. Before input is injected the window is brought to the front,
+   * so clicks and keys reach it even when other windows overlap it on the host display.
+   *
+   * @param input Input state of the session.
+   * @param window Native window handle, or 0 to stop targeting a window.
+   */
+  void set_window_target(const std::shared_ptr<input_t> &input, std::uint64_t window);
+
 #ifdef SUNSHINE_TESTS
   namespace testing {
     /**
