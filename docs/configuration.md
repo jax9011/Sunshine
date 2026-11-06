@@ -753,6 +753,92 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### vr_compose
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Windows only, hardware encoders only. Instead of streaming the desktop, capture the windows chosen by the VR
+            client (`/vrcompose`) one by one with Windows.Graphics.Capture, like OBS window capture, and place them side
+            by side in one image. A window never shows another window that overlaps it on the PC. Dialogs of an app stay
+            inside that app's window on the client. The atlas grows (1x to 3x the screen per side) when many windows are open.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            vr_compose = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### local_mouse_policy
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Windows only. Controls what happens when a real mouse is attached to the host while a Moonlight
+            client is also sending input (for example the on-screen buttons and touch controls of a phone).
+            <br>
+            <br>
+            <table>
+                <tr><td>allow</td><td>Both the physical mouse and the client work at the same time (upstream behavior).</td></tr>
+                <tr><td>remote_priority</td><td>The physical mouse is ignored while the client is active, so the client
+                    always wins and the cursor is never fought over. The mouse works again as soon as the client has been
+                    idle for @ref local_mouse_grace_ms "local_mouse_grace_ms". Software-injected input and touch are never blocked.</td></tr>
+            </table>
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            allow
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            local_mouse_policy = remote_priority
+            @endcode</td>
+    </tr>
+</table>
+
+### local_mouse_grace_ms
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            How long, in milliseconds, the physical mouse stays ignored after the last client input when
+            @ref local_mouse_policy "local_mouse_policy" is `remote_priority`.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            1500
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Allowed values</td>
+        <td colspan="2">200 to 10000</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            local_mouse_grace_ms = 1500
+            @endcode</td>
+    </tr>
+</table>
+
 ### keybindings
 
 <table>
