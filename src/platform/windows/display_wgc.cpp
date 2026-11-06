@@ -100,7 +100,7 @@ namespace platf::dxgi {
    * @brief Initialize the Windows.Graphics.Capture backend.
    * @return 0 on success, -1 on failure.
    */
-  int wgc_capture_t::init(display_base_t *display, const ::video::config_t &config) {
+  int wgc_capture_t::init(display_base_t *display, const ::video::config_t &config, HWND target) {
     HRESULT status;
     dxgi::dxgi_t dxgi;
     winrt::com_ptr<::IInspectable> d3d_comhandle;
@@ -122,16 +122,33 @@ namespace platf::dxgi {
       return -1;
     }
 
+    // C++/WinRT turns E_OUTOFMEMORY into std::bad_alloc, which the hresult_error handlers below do not catch.
+    // Remember the step so the log says which Windows.Graphics.Capture call failed.
+    const char *step = "start";
+    try {
+    step = "create the WinRT Direct3D device";
     DXGI_OUTPUT_DESC output_desc;
     uwp_device = d3d_comhandle.as<winrt::IDirect3DDevice>();
     display->output->GetDesc(&output_desc);
 
+    step = "get the capture item factory";
     auto monitor_factory = winrt::get_activation_factory<winrt::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-    if (monitor_factory == nullptr || FAILED(status = monitor_factory->CreateForMonitor(output_desc.Monitor, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
+    if (target) {
+      // Capture one window. Other windows overlapping it never show up in the frames.
+      window_capture = true;
+      if (monitor_factory == nullptr || FAILED(status = monitor_factory->CreateForWindow(target, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
+        BOOST_LOG(error) << "Window capture failed: couldn't create a capture item for the window: [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
+      step = "read the window capture size";
+      window_width = item.Size().Width;
+      window_height = item.Size().Height;
+    } else if (monitor_factory == nullptr || FAILED(status = monitor_factory->CreateForMonitor(output_desc.Monitor, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
       BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to acquire display: [0x"sv << util::hex(status).to_string_view() << ']';
       return -1;
     }
 
+    step = "create the frame pool";
     if (config.dynamicRange) {
       display->capture_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     } else {
@@ -139,13 +156,17 @@ namespace platf::dxgi {
     }
 
     try {
+      step = "create the frame pool";
       frame_pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(uwp_device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(display->capture_format), 2, item.Size());
+      step = "create the capture session";
       capture_session = frame_pool.CreateCaptureSession(item);
+      step = "register the frame callback";
       frame_pool.FrameArrived({this, &wgc_capture_t::on_frame_arrived});
     } catch (winrt::hresult_error &e) {
       BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to create capture session: [0x"sv << util::hex(e.code()).to_string_view() << ']';
       return -1;
     }
+    step = "disable the capture border";
     try {
       if (winrt::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"IsBorderRequired")) {
         capture_session.IsBorderRequired(false);
@@ -155,6 +176,7 @@ namespace platf::dxgi {
     } catch (winrt::hresult_error &e) {
       BOOST_LOG(warning) << "Screen capture may not be fully supported on this device for this release of Windows: failed to disable border around capture area: [0x"sv << util::hex(e.code()).to_string_view() << ']';
     }
+    step = "set MinUpdateInterval";
     try {
       if (winrt::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {
         capture_session.MinUpdateInterval(4ms);  // 250Hz
@@ -164,6 +186,7 @@ namespace platf::dxgi {
     } catch (winrt::hresult_error &e) {
       BOOST_LOG(warning) << "Screen capture may be capped to 60fps on this device for this release of Windows: failed to set MinUpdateInterval: [0x"sv << util::hex(e.code()).to_string_view() << ']';
     }
+    step = "start the capture";
     try {
       capture_session.StartCapture();
     } catch (winrt::hresult_error &e) {
@@ -171,6 +194,51 @@ namespace platf::dxgi {
       return -1;
     }
     return 0;
+    } catch (const winrt::hresult_error &e) {
+      BOOST_LOG(error) << "Capture init failed at step '"sv << step << "': [0x"sv << util::hex(static_cast<HRESULT>(e.code())).to_string_view() << "] "sv << winrt::to_string(e.message());
+      return -1;
+    } catch (const std::bad_alloc &) {
+      BOOST_LOG(error) << "Capture init failed at step '"sv << step << "': out of memory (E_OUTOFMEMORY)"sv;
+      return -1;
+    } catch (const std::exception &e) {
+      BOOST_LOG(error) << "Capture init failed at step '"sv << step << "': "sv << e.what();
+      return -1;
+    }
+  }
+
+  std::pair<int, int> wgc_capture_t::item_size() const {
+    if (!item) {
+      return {0, 0};
+    }
+    const auto size = item.Size();
+    return {size.Width, size.Height};
+  }
+
+  HWND parse_window_display_name(const std::string &display_name) {
+    if (display_name.rfind(WINDOW_DISPLAY_PREFIX, 0) != 0) {
+      return nullptr;
+    }
+    try {
+      return reinterpret_cast<HWND>(static_cast<std::uintptr_t>(std::stoull(display_name.substr(WINDOW_DISPLAY_PREFIX.size()))));
+    } catch (const std::exception &) {
+      return nullptr;
+    }
+  }
+
+  void apply_window_geometry(display_base_t &display, HWND hwnd, int width, int height) {
+    RECT frame {};
+    if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)) != S_OK) {
+      GetWindowRect(hwnd, &frame);
+    }
+
+    display.width = display.width_before_rotation = width;
+    display.height = display.height_before_rotation = height;
+    display.display_rotation = DXGI_MODE_ROTATION_IDENTITY;
+
+    // Absolute mouse coordinates are relative to the top-left corner of the virtual desktop.
+    display.offset_x = frame.left - GetSystemMetrics(SM_XVIRTUALSCREEN);
+    display.offset_y = frame.top - GetSystemMetrics(SM_YVIRTUALSCREEN);
+    display.logical_width = display.logical_height = 0;
   }
 
   /**
@@ -224,6 +292,15 @@ namespace platf::dxgi {
       return capture_e::timeout;
     }
 
+    if (window_capture) {
+      // The window was resized; the pipeline must be rebuilt for the new size.
+      const auto content = consumed_frame.ContentSize();
+      if (content.Width != window_width || content.Height != window_height) {
+        BOOST_LOG(info) << "Captured window resized ["sv << window_width << 'x' << window_height << " -> "sv << content.Width << 'x' << content.Height << ']';
+        return capture_e::reinit;
+      }
+    }
+
     auto capture_access = consumed_frame.Surface().as<winrt::IDirect3DDxgiInterfaceAccess>();
     if (capture_access == nullptr) {
       return capture_e::capture_error;
@@ -253,8 +330,13 @@ namespace platf::dxgi {
   }
 
   int display_wgc_ram_t::init(const ::video::config_t &config, const std::string &display_name) {
-    if (display_base_t::init(config, display_name) || dup.init(this, config)) {
+    const auto target = parse_window_display_name(display_name);
+    if (display_base_t::init(config, target ? std::string {} : display_name) || dup.init(this, config, target)) {
       return -1;
+    }
+    if (target) {
+      const auto [window_w, window_h] = dup.item_size();
+      apply_window_geometry(*this, target, window_w, window_h);
     }
 
     texture.reset();

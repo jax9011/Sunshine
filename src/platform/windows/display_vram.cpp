@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <span>
+#include <thread>
 
 // platform includes
 #include <d3dcompiler.h>
@@ -23,6 +24,7 @@ extern "C" {
 
 // local includes
 #include "display.h"
+#include "src/platform/windows/vr_compose.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/logging.h"
@@ -1915,11 +1917,292 @@ namespace platf::dxgi {
   }
 
   int display_wgc_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
-    if (display_base_t::init(config, display_name) || dup.init(this, config)) {
+    const auto target = parse_window_display_name(display_name);
+    if (display_base_t::init(config, target ? std::string {} : display_name) || dup.init(this, config, target)) {
       return -1;
+    }
+    if (target) {
+      const auto [window_w, window_h] = dup.item_size();
+      apply_window_geometry(*this, target, window_w, window_h);
     }
 
     return 0;
+  }
+
+  int display_vr_compose_vram_t::init(const ::video::config_t &config, const std::string &) {
+    // The primary monitor only tells how big the screen is; nothing of it is captured.
+    if (display_base_t::init(config, std::string {})) {
+      return -1;
+    }
+    stream_config = config;
+    capture_format = config.dynamicRange ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    screen_w = width_before_rotation;
+    screen_h = height_before_rotation;
+
+    vr_compose::refresh(screen_w, screen_h);
+    const auto layout = vr_compose::current();
+    atlas_w = layout.atlas_w;
+    atlas_h = layout.atlas_h;
+
+    // The rest of the pipeline sees a display as big as the atlas. Absolute mouse positions sent by the
+    // VR client are relative to the atlas, which keeps the monitor's offset so they land on the real desktop.
+    width = width_before_rotation = atlas_w;
+    height = height_before_rotation = atlas_h;
+    display_rotation = DXGI_MODE_ROTATION_IDENTITY;
+    logical_width = logical_height = 0;
+
+    D3D11_TEXTURE2D_DESC t {};
+    t.Width = atlas_w;
+    t.Height = atlas_h;
+    t.MipLevels = 1;
+    t.ArraySize = 1;
+    t.SampleDesc.Count = 1;
+    t.Usage = D3D11_USAGE_DEFAULT;
+    t.Format = capture_format;
+    t.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    auto status = device->CreateTexture2D(&t, nullptr, &atlas);
+    if (FAILED(status)) {
+      BOOST_LOG(error) << "Failed to create the window atlas [0x"sv << util::hex(status).to_string_view() << ']';
+      return -1;
+    }
+    status = device->CreateRenderTargetView(atlas.get(), nullptr, &atlas_rt);
+    if (FAILED(status)) {
+      BOOST_LOG(error) << "Failed to create the window atlas view [0x"sv << util::hex(status).to_string_view() << ']';
+      return -1;
+    }
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    device_ctx->ClearRenderTargetView(atlas_rt.get(), black);
+
+    // No window capture is opened here. init() also runs while Sunshine tests the encoders, on whatever thread
+    // handles the launch request, and a window can disappear or refuse capture at any moment. The first
+    // snapshot() opens the captures on the capture thread, one window at a time, and survives a failing window.
+    layout_version = ~0u;
+    redraw_all = true;
+    BOOST_LOG(info) << "Composed window capture: atlas "sv << atlas_w << 'x' << atlas_h << ", " << layout.slots.size() << " window(s)";
+    return 0;
+  }
+
+  bool display_vr_compose_vram_t::sync_sources() {
+    const auto layout = vr_compose::current();
+    bool resized = false;
+
+    // Drop windows that are no longer composed
+    groups.clear();
+    for (auto it = sources.begin(); it != sources.end();) {
+      bool kept = false;
+      for (const auto &slot : layout.slots) {
+        for (const auto &m : slot.members) {
+          kept = kept || m.hwnd == (*it)->hwnd;
+        }
+      }
+      it = kept ? std::next(it) : sources.erase(it);
+    }
+
+    auto find_source = [this](std::uint64_t hwnd) -> source_t * {
+      for (auto &s : sources) {
+        if (s->hwnd == hwnd) {
+          return s.get();
+        }
+      }
+      return nullptr;
+    };
+
+    // Open one window capture. A window that cannot be captured is skipped and the reason is logged.
+    auto open_source = [this](std::uint64_t hwnd) -> std::unique_ptr<source_t> {
+      try {
+        auto created = std::make_unique<source_t>();
+        created->hwnd = hwnd;
+        created->capture = std::make_unique<wgc_capture_t>();
+        const auto target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(hwnd));
+        if (created->capture->init(this, stream_config, target)) {
+          BOOST_LOG(warning) << "Could not capture window " << hwnd << " (see the error above)";
+          return nullptr;
+        }
+        created->capture->set_cursor_visible(false);
+        return created;
+      } catch (const winrt::hresult_error &e) {
+        BOOST_LOG(warning) << "Could not capture window " << hwnd << ": [0x"sv << util::hex(static_cast<HRESULT>(e.code())).to_string_view() << "] "sv << winrt::to_string(e.message());
+      } catch (const std::exception &e) {
+        BOOST_LOG(warning) << "Could not capture window " << hwnd << ": "sv << e.what();
+      } catch (...) {
+        BOOST_LOG(warning) << "Could not capture window " << hwnd << ": unknown exception"sv;
+      }
+      return nullptr;
+    };
+
+    // Open new windows and put every window where its slot says
+    for (const auto &slot : layout.slots) {
+      group_t group;
+      // Members are listed front-most first; the slot is drawn back to front
+      for (auto m = slot.members.rbegin(); m != slot.members.rend(); ++m) {
+        auto *source = find_source(m->hwnd);
+        if (!source) {
+          auto created = open_source(m->hwnd);
+          if (!created) {
+            vr_compose::set_actual_size(m->hwnd, 0, 0);
+            continue;
+          }
+          source = created.get();
+          sources.push_back(std::move(created));
+        }
+        source->ax = slot.ax + m->ox;
+        source->ay = slot.ay + m->oy;
+
+        const auto [item_w, item_h] = source->capture->item_size();
+        if (item_w > 0 && item_h > 0 && (item_w != m->w || item_h != m->h)) {
+          vr_compose::set_actual_size(m->hwnd, item_w, item_h);
+          resized = true;
+        }
+
+        if (!source->last || source->w != m->w || source->h != m->h) {
+          source->w = m->w;
+          source->h = m->h;
+          source->has_frame = false;
+          source->last.reset();
+          D3D11_TEXTURE2D_DESC t {};
+          t.Width = source->w;
+          t.Height = source->h;
+          t.MipLevels = 1;
+          t.ArraySize = 1;
+          t.SampleDesc.Count = 1;
+          t.Usage = D3D11_USAGE_DEFAULT;
+          t.Format = capture_format;
+          t.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+          if (FAILED(device->CreateTexture2D(&t, nullptr, &source->last))) {
+            BOOST_LOG(warning) << "Could not create the picture buffer of window " << m->hwnd;
+            continue;
+          }
+        }
+        group.members.push_back(source);
+      }
+      groups.push_back(std::move(group));
+    }
+
+    if (!resized) {
+      layout_version = layout.version;
+      const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+      device_ctx->ClearRenderTargetView(atlas_rt.get(), black);
+      redraw_all = true;  // windows that did not change are drawn again from their kept pictures
+    }
+    return resized;
+  }
+
+  capture_e display_vr_compose_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool) {
+    // The client changed the window list, or a window changed size
+    vr_compose::refresh(screen_w, screen_h);
+    {
+      const auto layout = vr_compose::current();
+      if (layout.atlas_w != atlas_w || layout.atlas_h != atlas_h) {
+        BOOST_LOG(info) << "Window atlas size changed [" << atlas_w << 'x' << atlas_h << " -> " << layout.atlas_w << 'x' << layout.atlas_h << ']';
+        return capture_e::reinit;
+      }
+      if (layout.version != layout_version) {
+        try {
+          if (sync_sources()) {
+            return capture_e::reinit;
+          }
+        } catch (const std::exception &e) {
+          BOOST_LOG(error) << "Composed window capture: updating the window list failed: "sv << e.what();
+          return capture_e::capture_error;
+        } catch (...) {
+          BOOST_LOG(error) << "Composed window capture: updating the window list failed"sv;
+          return capture_e::capture_error;
+        }
+      }
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::vector<bool> dirty(groups.size(), redraw_all);
+    bool updated = redraw_all;
+    redraw_all = false;
+    uint64_t frame_qpc = 0;
+    do {
+      for (size_t g = 0; g < groups.size(); ++g) {
+        for (auto *source : groups[g].members) {
+          texture2d_t src;
+          uint64_t qpc = 0;
+          capture_e status = capture_e::timeout;
+          try {
+            status = source->capture->next_frame(std::chrono::milliseconds(0), &src, qpc);
+          } catch (const winrt::hresult_error &e) {
+            BOOST_LOG(error) << "Composed window capture: window "sv << source->hwnd << " failed: [0x"sv << util::hex(static_cast<HRESULT>(e.code())).to_string_view() << "] "sv << winrt::to_string(e.message());
+            return capture_e::capture_error;
+          }
+          if (status == capture_e::ok) {
+            D3D11_TEXTURE2D_DESC desc;
+            src->GetDesc(&desc);
+            const D3D11_BOX box {
+              0,
+              0,
+              0,
+              std::min<UINT>(desc.Width, static_cast<UINT>(source->w)),
+              std::min<UINT>(desc.Height, static_cast<UINT>(source->h)),
+              1
+            };
+            device_ctx->CopySubresourceRegion(source->last.get(), 0, 0, 0, 0, src.get(), 0, &box);
+            source->has_frame = true;
+            dirty[g] = true;
+            frame_qpc = std::max(frame_qpc, qpc);
+            updated = true;
+          } else if (status == capture_e::reinit) {
+            vr_compose::set_actual_size(source->hwnd, 0, 0);  // the window was resized: measure it again
+            return capture_e::reinit;
+          } else if (status != capture_e::timeout) {
+            return status;
+          }
+        }
+      }
+      if (!updated) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    } while (!updated && std::chrono::steady_clock::now() < deadline);
+
+    if (!updated) {
+      return capture_e::timeout;
+    }
+    if (frame_qpc == 0) {
+      frame_qpc = qpc_counter();
+    }
+
+    // Redraw every slot that changed, back to front, so a dialog stays on top of its window
+    for (size_t g = 0; g < groups.size(); ++g) {
+      if (!dirty[g]) {
+        continue;
+      }
+      for (auto *source : groups[g].members) {
+        if (source->has_frame) {
+          device_ctx->CopySubresourceRegion(atlas.get(), 0, source->ax, source->ay, 0, source->last.get(), 0, nullptr);
+        }
+      }
+    }
+
+    std::shared_ptr<platf::img_t> img;
+    if (!pull_free_image_cb(img)) {
+      return capture_e::interrupted;
+    }
+
+    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
+    d3d_img->blank = false;
+    if (complete_img(d3d_img.get(), false) != 0) {
+      return capture_e::capture_error;
+    }
+    texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
+    if (!lock_helper.lock()) {
+      BOOST_LOG(error) << "Failed to lock capture texture";
+      return capture_e::capture_error;
+    }
+    device_ctx->CopyResource(d3d_img->capture_texture.get(), atlas.get());
+
+    img_out = img;
+    img_out->frame_timestamp = std::chrono::steady_clock::now() - qpc_time_difference(qpc_counter(), frame_qpc);
+    return capture_e::ok;
+  }
+
+  capture_e display_vr_compose_vram_t::release_snapshot() {
+    for (auto &source : sources) {
+      source->capture->release_frame();
+    }
+    return capture_e::ok;
   }
 
   std::shared_ptr<platf::img_t> display_vram_t::alloc_img() {

@@ -44,6 +44,7 @@ enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE : DWORD {
 using D3DKMT_GPU_PREFERENCE_QUERY_STATE = _D3DKMT_GPU_PREFERENCE_QUERY_STATE;  ///< GPU preference query state reported by D3DKMT.
 
 #include "display.h"
+#include "src/platform/windows/vr_compose.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/display_device.h"
@@ -1027,7 +1028,26 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
-    if (config::video.capture == "ddx" || config::video.capture.empty()) {
+    // Window capture exists only in Windows.Graphics.Capture.
+    const bool window_target = dxgi::parse_window_display_name(display_name) != nullptr;
+
+    // VR client: capture chosen windows one by one into one image instead of the desktop.
+    // VR mode is window-only by design. It never falls back to desktop capture, including when the
+    // encoder is not a DXGI one (software encoding), because that would leak the host desktop.
+    if (!window_target && vr_compose::enabled()) {
+      if (hwdevice_type != mem_type_e::dxgi) {
+        BOOST_LOG(error) << "VR window-only mode needs a hardware (DXGI) encoder; refusing desktop capture"sv;
+        return nullptr;
+      }
+      auto disp = std::make_shared<dxgi::display_vr_compose_vram_t>();
+      if (!disp->init(config, display_name)) {
+        return disp;
+      }
+      BOOST_LOG(error) << "Composed window capture failed to start; refusing desktop fallback in VR mode"sv;
+      return nullptr;
+    }
+
+    if (!window_target && (config::video.capture == "ddx" || config::video.capture.empty())) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
 
@@ -1043,7 +1063,7 @@ namespace platf {
       }
     }
 
-    if (config::video.capture == "wgc" || config::video.capture.empty()) {
+    if (window_target || config::video.capture == "wgc" || config::video.capture.empty()) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
 

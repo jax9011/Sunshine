@@ -9,6 +9,9 @@
 #include <d3d11_4.h>
 #include <d3dcommon.h>
 #include <dwmapi.h>
+#include <memory>
+#include <string_view>
+#include <utility>
 #include <dxgi.h>
 #include <dxgi1_6.h>
 #include <Unknwn.h>
@@ -743,6 +746,29 @@ namespace platf::dxgi {
   };
 
   /**
+   * @brief Display name prefix that selects window capture, followed by the decimal window handle.
+   */
+  inline constexpr std::string_view WINDOW_DISPLAY_PREFIX = "window:";
+
+  /**
+   * @brief Decode a display name produced for window capture.
+   *
+   * @param display_name Display name such as `window:131474`.
+   * @return The window handle, or `nullptr` if the name does not select a window.
+   */
+  HWND parse_window_display_name(const std::string &display_name);
+
+  /**
+   * @brief Describe a captured window to the rest of the pipeline as if it were a small display.
+   *
+   * @param display Display whose geometry is rewritten.
+   * @param hwnd Captured window.
+   * @param width Width of the window capture item in pixels.
+   * @param height Height of the window capture item in pixels.
+   */
+  void apply_window_geometry(display_base_t &display, HWND hwnd, int width, int height);
+
+  /**
    * Display duplicator that uses the Windows.Graphics.Capture API.
    */
   class wgc_capture_t {
@@ -754,6 +780,9 @@ namespace platf::dxgi {
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame consumed_frame {nullptr};
     SRWLOCK frame_lock = SRWLOCK_INIT;
     CONDITION_VARIABLE frame_present_cv;
+    bool window_capture = false;  ///< Whether the capture item is a single window instead of a monitor.
+    int window_width = 0;  ///< Expected content width of the captured window.
+    int window_height = 0;  ///< Expected content height of the captured window.
 
     void on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
 
@@ -762,13 +791,20 @@ namespace platf::dxgi {
     ~wgc_capture_t();
 
     /**
-     * @brief Initialize D3D cursor rendering resources for GPU capture.
+     * @brief Initialize the capture of a monitor or of a single window.
      *
      * @param display Display object or identifier associated with the operation.
      * @param config Configuration values to apply.
+     * @param target Window to capture instead of the monitor, or `nullptr` for the monitor.
      * @return 0 on success; nonzero or negative platform status on failure.
      */
-    int init(display_base_t *display, const ::video::config_t &config);
+    int init(display_base_t *display, const ::video::config_t &config, HWND target = nullptr);
+    /**
+     * @brief Size of the capture item, which for a window is the size of that window.
+     *
+     * @return Width and height in pixels, or 0x0 before init.
+     */
+    std::pair<int, int> item_size() const;
     /**
      * @brief Acquire the next frame from the Windows capture backend.
      *
@@ -855,6 +891,77 @@ namespace platf::dxgi {
      * @brief Release resources associated with the last captured snapshot.
      *
      * @return Capture status after releasing the current snapshot.
+     */
+    capture_e release_snapshot() override;
+  };
+  /**
+   * Display backend for the VR client: captures several windows one by one with
+   * Windows.Graphics.Capture and places them side by side in one atlas image (see vr_compose.h).
+   */
+  class display_vr_compose_vram_t: public display_vram_t {
+    /**
+     * @brief One captured window.
+     */
+    struct source_t {
+      std::uint64_t hwnd = 0;  ///< Native window handle.
+      std::unique_ptr<wgc_capture_t> capture;  ///< Window capture.
+      texture2d_t last;  ///< Latest picture of the window, kept so a slot can be redrawn when only one of its windows changed.
+      bool has_frame = false;  ///< Whether `last` holds a picture.
+      int ax = 0;  ///< Left edge in the atlas.
+      int ay = 0;  ///< Top edge in the atlas.
+      int w = 0;  ///< Width of the window picture.
+      int h = 0;  ///< Height of the window picture.
+    };
+
+    /**
+     * @brief The windows of one slot, back to front.
+     */
+    struct group_t {
+      std::vector<source_t *> members;  ///< Sources of the slot.
+    };
+
+    std::vector<std::unique_ptr<source_t>> sources;  ///< Windows captured right now.
+    std::vector<group_t> groups;  ///< Slots of the atlas.
+    texture2d_t atlas;  ///< Image all windows are copied into.
+    render_target_t atlas_rt;  ///< Used to clear the atlas.
+    ::video::config_t stream_config {};  ///< Stream settings, needed to open window captures.
+    int atlas_w = 0;  ///< Atlas width.
+    int atlas_h = 0;  ///< Atlas height.
+    int screen_w = 0;  ///< Primary monitor width.
+    int screen_h = 0;  ///< Primary monitor height.
+    unsigned layout_version = 0;  ///< Layout the sources were built for.
+    bool redraw_all = false;  ///< Draw every slot again (the layout changed).
+
+    /**
+     * @brief Open captures for the windows of the layout and drop the others.
+     *
+     * @return `true` when the pipeline has to be rebuilt because a window picture has another size than planned.
+     */
+    bool sync_sources();
+
+  public:
+    /**
+     * @brief Initialize the atlas and the window captures.
+     *
+     * @param config Configuration values to apply.
+     * @param display_name Ignored: the primary monitor defines the screen size.
+     * @return 0 on success; nonzero or negative platform status on failure.
+     */
+    int init(const ::video::config_t &config, const std::string &display_name);
+    /**
+     * @brief Copy fresh window frames into the atlas and hand the atlas to the encoder.
+     *
+     * @param pull_free_image_cb Callback that provides an available image buffer.
+     * @param img_out Captured image buffer returned to the streaming pipeline.
+     * @param timeout Maximum time to wait for the operation.
+     * @param cursor_visible Ignored: the VR client draws its own pointer.
+     * @return Capture status reported to the streaming pipeline.
+     */
+    capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
+    /**
+     * @brief Release the window frames used by the last snapshot.
+     *
+     * @return Capture status after releasing the frames.
      */
     capture_e release_snapshot() override;
   };
