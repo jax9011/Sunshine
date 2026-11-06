@@ -348,6 +348,22 @@ watch(
               v-model="config.native_pen_touch"
               default="true"
     ></Checkbox>
+
+    <!-- Physical mouse on the host while a client is active (Windows) -->
+    <div v-if="config.mouse === 'enabled' && platform === 'windows'" class="mb-3">
+      <label for="local_mouse_policy" class="form-label">{{ $t('config.local_mouse_policy') }}</label>
+      <select id="local_mouse_policy" class="form-select" v-model="config.local_mouse_policy">
+        <option value="allow">{{ $t('config.local_mouse_policy_allow') }}</option>
+        <option value="remote_priority">{{ $t('config.local_mouse_policy_remote_priority') }}</option>
+      </select>
+      <div class="form-text">{{ $t('config.local_mouse_policy_desc') }}</div>
+    </div>
+    <div v-if="config.mouse === 'enabled' && platform === 'windows' && config.local_mouse_policy === 'remote_priority'" class="mb-3">
+      <label for="local_mouse_grace_ms" class="form-label">{{ $t('config.local_mouse_grace_ms') }}</label>
+      <input type="number" min="200" max="10000" class="form-control" id="local_mouse_grace_ms" placeholder="1500"
+             v-model="config.local_mouse_grace_ms" />
+      <div class="form-text">{{ $t('config.local_mouse_grace_ms_desc') }}</div>
+    </div>
   </div>
 </template>
 
