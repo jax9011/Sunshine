@@ -295,6 +295,20 @@
                       v-model="editForm['wait-all']"
                       default="true"
             ></Checkbox>
+            <!-- window mode (own window only) -->
+            <Checkbox v-if="platform === 'windows'"
+                      class="mb-3"
+                      id="windowMode"
+                      label="apps.window_mode"
+                      desc="apps.window_mode_desc"
+                      v-model="editForm['window-mode']"
+                      default="false"
+            ></Checkbox>
+            <div v-if="platform === 'windows' && editForm['window-mode']" class="mb-3">
+              <label for="windowMatch" class="form-label">{{ $t('apps.window_match') }}</label>
+              <input type="text" class="form-control" id="windowMatch" v-model="editForm['window-match']" />
+              <div class="form-text">{{ $t('apps.window_match_desc') }}</div>
+            </div>
             <!-- exit timeout -->
             <div class="mb-3">
               <label for="exitTimeout" class="form-label">{{ $t('apps.exit_timeout') }}</label>
@@ -801,6 +815,8 @@
           elevated: false,
           "auto-detach": true,
           "wait-all": true,
+          "window-mode": false,
+          "window-match": "",
           "exit-timeout": 5,
           "prep-cmd": [],
           detached: [],
@@ -826,6 +842,9 @@
         }
         if (this.editForm["wait-all"] === undefined) {
           this.editForm["wait-all"] = true;
+        }
+        if (this.editForm["window-mode"] === undefined) {
+          this.editForm["window-mode"] = false;
         }
         if (this.editForm["exit-timeout"] === undefined) {
           this.editForm["exit-timeout"] = 5;
