@@ -174,6 +174,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/video_colorspace.cpp"
         "${CMAKE_SOURCE_DIR}/src/video_colorspace.h"
         "${CMAKE_SOURCE_DIR}/src/input.cpp"
+        "${CMAKE_SOURCE_DIR}/src/input_arbiter.cpp"
+        "${CMAKE_SOURCE_DIR}/src/input_arbiter.h"
         "${CMAKE_SOURCE_DIR}/src/input.h"
         "${CMAKE_SOURCE_DIR}/src/audio.cpp"
         "${CMAKE_SOURCE_DIR}/src/audio.h"
@@ -192,6 +194,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/thread_safe.h"
         "${CMAKE_SOURCE_DIR}/src/sync.h"
         "${CMAKE_SOURCE_DIR}/src/round_robin.h"
+        "${CMAKE_SOURCE_DIR}/src/window_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/window_policy.h"
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.h"
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.cpp"
         ${PLATFORM_TARGET_FILES})

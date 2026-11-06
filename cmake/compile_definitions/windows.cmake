@@ -75,6 +75,14 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/audio.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/local_input_guard.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/local_input_guard.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/vr_compose.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/vr_compose.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/vr_windows.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/vr_windows.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/window_host.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/window_host.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Client.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Common.h"
@@ -101,6 +109,7 @@ list(PREPEND PLATFORM_LIBRARIES
         minhook::minhook
         ntdll
         setupapi
+        shell32
         shlwapi
         synchronization.lib
         userenv
