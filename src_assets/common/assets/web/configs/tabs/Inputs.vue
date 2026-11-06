@@ -349,6 +349,15 @@ watch(
               default="true"
     ></Checkbox>
 
+    <!-- VR window-only capture (Windows) -->
+    <Checkbox v-if="platform === 'windows'"
+              class="mb-3"
+              id="vr_compose"
+              locale-prefix="config"
+              v-model="config.vr_compose"
+              default="false"
+    ></Checkbox>
+
     <!-- Physical mouse on the host while a client is active (Windows) -->
     <div v-if="config.mouse === 'enabled' && platform === 'windows'" class="mb-3">
       <label for="local_mouse_policy" class="form-label">{{ $t('config.local_mouse_policy') }}</label>
