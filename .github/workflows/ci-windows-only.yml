@@ -1,0 +1,13 @@
+name: Windows-only build
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  windows:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      publish_release: 'false'
+      release_commit: ${{ github.sha }}
+      release_version: '0.0.0'
