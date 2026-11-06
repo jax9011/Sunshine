@@ -253,6 +253,8 @@
     "local_mouse_policy_remote_priority": "Client has priority (ignore the host mouse while the client is active)",
     "virtualhid_randomize_mac": "Randomize virtual controller MAC",
     "virtualhid_randomize_mac_desc": "Use a random MAC address for PlayStation-style virtual controllers instead of one based on the controller index. This avoids mixing per-controller settings when controllers are swapped on the client.",
+    "vr_compose": "VR window-only capture",
+    "vr_compose_desc": "Windows only, hardware encoders only. Instead of the desktop, stream only the windows chosen by a VR client, each captured on its own and placed in one image. The desktop is never streamed in this mode. Default: disabled.",
     "encoder": "Force a Specific Encoder",
     "encoder_desc": "Force a specific encoder, otherwise Sunshine will select the best available option. Note: If you specify a hardware encoder on Windows, it must match the GPU where the display is connected.",
     "encoder_software": "Software",
